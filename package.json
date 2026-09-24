@@ -1,0 +1,20 @@
+{
+  "name": "banner-recall",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Banner Recall — private meeting memory. Meetings remembered. Decisions preserved. Actions clear.",
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "lint:web": "npm --workspace apps/web run lint",
+    "test:web": "npm --workspace apps/web run test",
+    "dev:worker": "python -m app.main",
+    "test:worker": "cd apps/worker && python -m pytest",
+    "db:start": "supabase start",
+    "db:reset": "supabase db reset",
+    "db:push": "supabase db push"
+  }
+}
