@@ -8,8 +8,10 @@ import { ReportSections } from "@/components/report-sections";
 import { MeetingHeaderActions } from "@/components/meeting-header-actions";
 import { ProcessingPanel } from "@/components/processing-panel";
 import { MediaPlayer } from "@/components/media-player";
+import { LiveTranscriptPanel } from "@/components/live-transcript";
+import { LiveIntelligencePanel } from "@/components/live-intelligence";
 import { formatDateTime, formatDurationSeconds } from "@/lib/format";
-import { ACTIVE_MEETING_STATUSES } from "@/lib/constants";
+import { ACTIVE_MEETING_STATUSES, SOURCE_TYPE_LABEL } from "@/lib/constants";
 import type {
   ActionItem,
   Decision,
@@ -19,6 +21,7 @@ import type {
   ProcessingJob,
   ProcessingJobEvent,
   Question,
+  SpeakerProfile,
   Summary,
   TranscriptSegment,
 } from "@/lib/types";
@@ -41,13 +44,23 @@ export default async function MeetingReportPage({
 
   const runId = m.current_run_id;
 
-  const [participantsRes, jobRes, eventsRes, segmentsRes, summaryRes, kpRes,
-    decRes, actRes, qRes] = await Promise.all([
+  const [sessionsRes, participantsRes, profilesRes, jobRes, eventsRes,
+    segmentsRes, summaryRes, kpRes, decRes, actRes, qRes] = await Promise.all([
+    supabase
+      .from("capture_sessions")
+      .select("id,status")
+      .eq("meeting_id", id)
+      .order("created_at", { ascending: false })
+      .limit(1),
     supabase
       .from("participants")
       .select("*")
       .eq("meeting_id", id)
       .order("created_at"),
+    supabase
+      .from("speaker_profiles")
+      .select("id, display_name")
+      .order("display_name"),
     supabase
       .from("processing_jobs")
       .select("*")
@@ -121,6 +134,18 @@ export default async function MeetingReportPage({
   const decisions = (decRes.data ?? []) as Decision[];
   const actionItems = (actRes.data ?? []) as ActionItem[];
   const questions = (qRes.data ?? []) as Question[];
+  const speakerProfiles = (profilesRes.data ?? []) as Pick<
+    SpeakerProfile,
+    "id" | "display_name"
+  >[];
+  const latestSession = (sessionsRes.data ?? [])[0] as
+    | { id: string; status: string }
+    | undefined;
+  const sessionActive =
+    latestSession &&
+    ["capturing", "paused", "stopped", "uploading", "uploaded"].includes(
+      latestSession.status,
+    );
 
   const isActive = ACTIVE_MEETING_STATUSES.includes(m.status);
   const hasReport = Boolean(runId && summary);
@@ -137,7 +162,8 @@ export default async function MeetingReportPage({
           </div>
           <p className="mt-1 text-sm text-muted">
             {formatDateTime(m.meeting_date)} ·{" "}
-            {formatDurationSeconds(m.duration_seconds)}
+            {formatDurationSeconds(m.duration_seconds)} ·{" "}
+            {SOURCE_TYPE_LABEL[m.source_type] ?? m.source_type}
             {m.source_file_name ? ` · ${m.source_file_name}` : ""}
           </p>
           {participants.length > 0 && (
@@ -188,6 +214,17 @@ export default async function MeetingReportPage({
         </p>
       ) : null}
 
+      {sessionActive && m.status !== "completed" && (
+        <LiveTranscriptPanel meetingId={m.id} sessionId={latestSession.id} />
+      )}
+
+      {sessionActive && m.status !== "completed" && (
+        <LiveIntelligencePanel
+          meetingId={m.id}
+          sessionId={latestSession.id}
+        />
+      )}
+
       <section aria-labelledby="transcript-heading">
         <h2
           id="transcript-heading"
@@ -200,6 +237,7 @@ export default async function MeetingReportPage({
             meetingId={m.id}
             segments={segments}
             participants={participants}
+            speakerProfiles={speakerProfiles}
           />
         ) : (
           <p className="rounded-lg border border-dashed border-border bg-surface p-6 text-sm text-muted">

@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     temp_dir: str | None = None
     transcribe_chunk_seconds: int = 600
     intelligence_chunk_chars: int = 60_000
+    # Live intelligence runs at most once per this many synced capture parts
+    # (bounds LLM spend during a live meeting).
+    live_intel_part_interval: int = 3
     # Provider request ceiling used to decide when chunking is required.
     transcribe_max_file_bytes: int = 24 * 1024 * 1024
 

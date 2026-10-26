@@ -60,19 +60,35 @@ export async function requestMeetingRetry(meetingId: string) {
   refresh(meetingId);
 }
 
+/** Recursively list every object path under a storage prefix (folders have
+ * id=null in storage.list responses). Live capture parts nest 3 deep. */
+async function listStorageObjects(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  prefix: string,
+): Promise<string[]> {
+  const { data } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .list(prefix, { limit: 1000 });
+  const paths: string[] = [];
+  for (const o of data ?? []) {
+    const p = `${prefix}${o.name}`;
+    if (o.id) paths.push(p);
+    else paths.push(...(await listStorageObjects(supabase, `${p}/`)));
+  }
+  return paths;
+}
+
 export async function deleteMeeting(meetingId: string) {
   uuid.parse(meetingId);
   const { supabase, user } = await requireUser();
 
   // Best-effort removal of stored recording objects before the DB cascade.
   const prefix = `${user.id}/${meetingId}/`;
-  const { data: objects } = await supabase.storage
-    .from(STORAGE_BUCKET)
-    .list(prefix, { limit: 100 });
-  if (objects && objects.length > 0) {
+  const paths = await listStorageObjects(supabase, prefix);
+  if (paths.length > 0) {
     const { error: rmErr } = await supabase.storage
       .from(STORAGE_BUCKET)
-      .remove(objects.map((o) => `${prefix}${o.name}`));
+      .remove(paths);
     if (rmErr) throw new Error(`Could not remove recording: ${rmErr.message}`);
   }
 
@@ -132,15 +148,37 @@ export async function removeParticipant(
   refresh(meetingId);
 }
 
-/** Assign a diarized speaker label to a named participant. */
+/** Assign a diarized speaker label to a named participant. When the name
+ * matches a known-speaker profile (or `saveAsProfile` creates one), the
+ * participant and segments link to it so corrections accumulate on a durable
+ * identity across meetings. */
 export async function assignSpeaker(
   meetingId: string,
   speakerLabel: string,
   displayName: string,
+  saveAsProfile = false,
 ) {
   uuid.parse(meetingId);
   const name = z.string().trim().min(1).max(200).parse(displayName);
   const { supabase, user } = await requireUser();
+
+  // Resolve the durable speaker identity for this name, if any.
+  const { data: profiles } = await supabase
+    .from("speaker_profiles")
+    .select("id")
+    .eq("owner_id", user.id)
+    .ilike("display_name", name)
+    .limit(1);
+  let profileId: string | null = profiles?.[0]?.id ?? null;
+  if (!profileId && saveAsProfile) {
+    const { data: createdProfile, error: pErr } = await supabase
+      .from("speaker_profiles")
+      .insert({ owner_id: user.id, display_name: name })
+      .select("id")
+      .single();
+    if (pErr) throw new Error(pErr.message);
+    profileId = createdProfile.id;
+  }
 
   // Find or create the participant mapped to this raw speaker label.
   const { data: existing } = await supabase
@@ -154,7 +192,7 @@ export async function assignSpeaker(
   if (existing) {
     const { error } = await supabase
       .from("participants")
-      .update({ display_name: name })
+      .update({ display_name: name, speaker_profile_id: profileId })
       .eq("id", existing.id);
     if (error) throw new Error(error.message);
     participantId = existing.id;
@@ -166,6 +204,7 @@ export async function assignSpeaker(
         owner_id: user.id,
         display_name: name,
         speaker_label: speakerLabel,
+        speaker_profile_id: profileId,
       })
       .select("id")
       .single();
@@ -175,7 +214,7 @@ export async function assignSpeaker(
 
   const { error: segErr } = await supabase
     .from("transcript_segments")
-    .update({ participant_id: participantId })
+    .update({ participant_id: participantId, speaker_profile_id: profileId })
     .eq("meeting_id", meetingId)
     .eq("speaker_label", speakerLabel);
   if (segErr) throw new Error(segErr.message);

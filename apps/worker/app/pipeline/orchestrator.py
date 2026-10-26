@@ -7,7 +7,9 @@ postponed (bounded backoff) or recorded terminally.
 """
 
 import logging
+import os
 import random
+import tempfile
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -27,9 +29,9 @@ from app.providers.base import (
     KnownSpeakerRef,
     TranscriptionProvider,
 )
-from app.queue.adapter import QueueMessage
+from app.queue.adapter import JOB_TYPE_CAPTURE_SYNC, QueueMessage
 from app.store.supabase_store import SupabaseStore
-from app.transcript.model import TranscriptChunk
+from app.transcript.model import NormalizedSegment, TranscriptChunk
 from app.transcript.normalize import (
     chunk_segments_by_chars,
     merge_chunk_segments,
@@ -50,6 +52,40 @@ STAGES = [
 
 MAX_BACKOFF_SECONDS = 900
 BASE_BACKOFF_SECONDS = 30
+
+
+def _flatten_live_intel(intel) -> list[dict]:
+    """Flatten MeetingIntelligence into live_intelligence_items rows. The
+    provisional set keeps evidence as live-segment indices; timestamps and
+    speaker labels are carried so the UI can anchor each candidate."""
+    items: list[dict] = []
+
+    def add(kind: str, content: str, speaker: str | None,
+            ts: int | None, evidence: list[int]) -> None:
+        items.append(
+            {
+                "item_index": len(items),
+                "kind": kind,
+                "content": content,
+                "speaker_label": speaker,
+                "timestamp_ms": ts,
+                "evidence_segment_indices": evidence,
+            }
+        )
+
+    for kp in intel.key_points:
+        add("key_point", kp.text, None, kp.timestamp_ms,
+            kp.evidence_segment_indices)
+    for d in intel.decisions:
+        add("decision", d.text, d.speaker_label, d.timestamp_ms,
+            d.evidence_segment_indices)
+    for a in intel.action_items:
+        add("action_item", a.task, a.owner_speaker_label, a.timestamp_ms,
+            a.evidence_segment_indices)
+    for q in intel.open_questions:
+        add("question", q.question, None, q.timestamp_ms,
+            q.evidence_segment_indices)
+    return items
 
 
 def backoff_seconds(attempt: int) -> int:
@@ -116,6 +152,8 @@ class Pipeline:
         """Process one queue message. Returns (action, delay_seconds) where
         action is 'done' | 'retry' | 'failed' and delay_seconds is the backoff
         the caller should apply before the message becomes visible again."""
+        if msg.job_type == JOB_TYPE_CAPTURE_SYNC:
+            return self.sync_capture(msg)
         job = self.store.get_job(msg.job_id)
         meeting = self.store.get_meeting(msg.meeting_id)
 
@@ -153,9 +191,9 @@ class Pipeline:
 
         try:
             with self.stage(job, "validate"):
-                if meeting["source_type"] != "upload" or not meeting.get(
-                    "source_file_path"
-                ):
+                # Every capture source converges on a stored media file; the
+                # source_type enum is informational here.
+                if not meeting.get("source_file_path"):
                     raise MissingSourceError()
 
             with self.stage(job, "download"):
@@ -175,7 +213,7 @@ class Pipeline:
                     )
                     duration_seconds = int(round(info.duration_seconds))
 
-                known_speakers = self._known_speaker_refs(owner_id)
+                known_speakers, known_profiles = self._known_speakers(owner_id)
 
                 with self.stage(job, "transcribe"):
                     per_chunk: list[list] = []
@@ -204,13 +242,12 @@ class Pipeline:
                 labels = sorted(
                     {s.speaker_label for s in segments if s.speaker_label}
                 )
-                known_names = {r.name for r in known_speakers}
                 speaker_map = self.store.map_speakers(
                     meeting_id=meeting_id,
                     owner_id=owner_id,
                     run_id=run_id,
                     speaker_labels=labels,
-                    known_names=known_names,
+                    known_profiles=known_profiles,
                 )
 
             with self.stage(job, "intelligence"):
@@ -273,13 +310,186 @@ class Pipeline:
                 ),
             )
 
+    # ------------------------------------------------------------- live sync
+
+    def sync_capture(self, msg: QueueMessage) -> tuple[str, int]:
+        """Transcribe the not-yet-synced audio tail of a capture session.
+
+        Parts are MediaRecorder timeslice fragments of one continuous
+        container; byte-concatenating them reconstructs a decodable file. One
+        transcribe call per contiguous run. Committed atomically via
+        commit_capture_sync — a false return means a concurrent sync won.
+        """
+        session = self.store.get_capture_session(msg.capture_session_id)
+        if session is None:
+            raise InvalidMessageError("Capture session no longer exists.")
+
+        parts = self.store.list_capture_parts(session["id"])
+        # NB: `or -1` would be wrong — cursor 0 is falsy but valid.
+        raw_cursor = session.get("transcribed_part_index")
+        cursor = -1 if raw_cursor is None else int(raw_cursor)
+        start_ms = int(session.get("transcribed_ms_end") or 0)
+
+        # Longest contiguous 'uploaded' run starting at cursor+1.
+        run: list[dict] = []
+        expected = cursor + 1
+        for part in parts:
+            idx = int(part["part_index"])
+            if idx <= cursor:
+                continue
+            if idx != expected or part["status"] != "uploaded":
+                break
+            run.append(part)
+            expected += 1
+        if not run:
+            return "done", 0  # nothing new — message already converged
+
+        new_cursor = int(run[-1]["part_index"])
+        try:
+            concat_path = self._concat_parts(session["id"], parts, new_cursor)
+
+            with ffmpeg.make_work_dir(self.settings.temp_dir) as work:
+                # Slice to EOF: the live concat is streaming WebM with no
+                # duration metadata, so measure the output MP3 instead.
+                slice_path = ffmpeg.extract_audio_slice(
+                    concat_path, start_ms / 1000, None,
+                    f"{work}/live_slice.mp3",
+                )
+                slice_info = ffmpeg.probe(slice_path)
+                end_ms = start_ms + int(round(slice_info.duration_seconds * 1000))
+                if end_ms <= start_ms:
+                    # New part not yet decodable past the watermark.
+                    return "retry", 15
+                known_refs, _ = self._known_speakers(session["owner_id"])
+                result = self.transcription.transcribe(
+                    TranscriptChunk(
+                        path=slice_path, offset_seconds=start_ms / 1000
+                    ),
+                    known_refs,
+                )
+            segments = merge_chunk_segments([result.segments])
+            committed = self.store.commit_capture_sync(
+                session_id=session["id"],
+                expected_cursor=cursor,
+                new_cursor=new_cursor,
+                new_ms_end=end_ms,
+                segments=[
+                    {
+                        "segment_index": s.segment_index,
+                        "speaker_label": s.speaker_label,
+                        "start_ms": s.start_ms,
+                        "end_ms": s.end_ms,
+                        "text": s.text,
+                    }
+                    for s in segments
+                ],
+            )
+            if committed:
+                self._maybe_sync_intel(session["id"], new_cursor)
+            return ("done" if committed else "retry"), (0 if committed else 5)
+        except PipelineError as exc:
+            # Transient failures leave parts 'uploaded'; the next part's
+            # message converges the session anyway.
+            log.warning(
+                "capture sync failed", extra={"session_id": session["id"]},
+                exc_info=exc,
+            )
+            return "retry", 30
+
+    def _concat_parts(
+        self, session_id: str, parts: list[dict], through_index: int
+    ) -> str:
+        """Persisted concat cache: {temp}/banner-live-{session} holds the bytes
+        of parts 0..K; a sidecar .idx records K. Appends or rebuilds as needed."""
+        base = self.settings.temp_dir or tempfile.gettempdir()
+        cache = os.path.join(base, f"banner-live-{session_id}")
+        sidecar = f"{cache}.idx"
+
+        cached_through = -1
+        if os.path.exists(cache) and os.path.exists(sidecar):
+            try:
+                with open(sidecar) as fh:
+                    cached_through = int(fh.read().strip())
+            except (ValueError, OSError):
+                cached_through = -1
+
+        # Cache can only append contiguously from where it left off.
+        if cached_through >= through_index:
+            return cache
+
+        # Append only when the sidecar proves what the cache already holds.
+        mode = "ab" if cached_through >= 0 else "wb"
+        if mode == "wb":
+            cached_through = -1
+        with open(cache, mode) as fh:
+            for part in parts:
+                idx = int(part["part_index"])
+                if idx <= cached_through or idx > through_index:
+                    continue
+                fh.write(self.store.download_source(part["storage_path"]))
+                cached_through = idx
+        with open(sidecar, "w") as fh:
+            fh.write(str(cached_through))
+        return cache
+
+    def _maybe_sync_intel(self, session_id: str, new_cursor: int) -> None:
+        """Regenerate live candidate intelligence when enough new audio has
+        been transcribed. Failures never block transcript sync — the next
+        commit retries the analysis."""
+        try:
+            fresh = self.store.get_capture_session(session_id)
+            if not fresh:
+                return
+            raw = fresh.get("intel_part_index")
+            intel_cursor = -1 if raw is None else int(raw)
+            if new_cursor - intel_cursor < self.settings.live_intel_part_interval:
+                return
+            rows = self.store.list_live_segments(session_id)
+            if not rows:
+                return
+            segments = [
+                NormalizedSegment(
+                    segment_index=i,
+                    start_ms=int(r["start_ms"]),
+                    end_ms=int(r["end_ms"]),
+                    speaker_label=r.get("speaker_label"),
+                    text=r["text"],
+                )
+                for i, r in enumerate(rows)
+            ]
+            result = self.intelligence.analyze(
+                render_transcript_for_prompt(segments),
+                prompt_version="live_intel_v1",
+            )
+            intel = validate_evidence(result.data, len(segments))
+            items = _flatten_live_intel(intel)
+            self.store.commit_capture_intel(
+                session_id=session_id,
+                expected_cursor=intel_cursor,
+                new_cursor=new_cursor,
+                items=items,
+            )
+        except Exception as exc:
+            log.warning(
+                "live intel run failed", extra={"session_id": session_id},
+                exc_info=exc,
+            )
+
     # ----------------------------------------------------------------- helpers
 
-    def _known_speaker_refs(self, owner_id: str) -> list[KnownSpeakerRef]:
-        """Load known-speaker reference clips for provider-side identity hints.
-        Only clips the owner explicitly enrolled are used."""
+    def _known_speakers(
+        self, owner_id: str
+    ) -> tuple[list[KnownSpeakerRef], dict[str, str]]:
+        """Load enrolled speaker profiles. Returns (provider refs, name ->
+        profile_id). Only clips the owner explicitly enrolled are used as
+        references, but every profile name is a valid known-speaker label."""
         refs: list[KnownSpeakerRef] = []
-        for row in self.store.speaker_reference_clips(owner_id):
+        profiles: dict[str, str] = {}
+        for row in self.store.speaker_profiles_for_owner(owner_id):
+            profiles[row["display_name"]] = row["id"]
+            # The provider accepts at most 4 reference clips.
+            if not row.get("reference_storage_path") or len(refs) >= 4:
+                continue
             try:
                 data = self.store.download_source(row["reference_storage_path"])
             except Exception as exc:
@@ -288,7 +498,7 @@ class Pipeline:
             refs.append(
                 KnownSpeakerRef(name=row["display_name"], audio_bytes=data)
             )
-        return refs
+        return refs, profiles
 
     def _handle_failure(
         self, job: dict, meeting: dict, exc: PipelineError

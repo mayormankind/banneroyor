@@ -9,6 +9,10 @@ import {
   STORAGE_BUCKET,
 } from "@/lib/constants";
 import { formatBytes } from "@/lib/format";
+import {
+  CaptureRecorder,
+  type PreparedMeeting,
+} from "@/components/capture-recorder";
 
 type Phase =
   | { name: "form" }
@@ -63,6 +67,8 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
   const [consent, setConsent] = useState(false);
   const [phase, setPhase] = useState<Phase>({ name: "form" });
   const [error, setError] = useState<string | null>(null);
+  const [mode, setMode] = useState<"upload" | "record">("upload");
+  const [captureBusy, setCaptureBusy] = useState(false);
 
   const fileError = file
     ? !isAcceptedFile(file)
@@ -92,51 +98,85 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
     setError("Upload cancelled. The meeting was saved as a draft.");
   }
 
+  /** Create the meeting row (+participants). Shared by upload and record. */
+  async function createMeeting(sourceType: "upload" | "browser") {
+    const supabase = createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) throw new Error("You must be signed in.");
+
+    const { data: meeting, error: meetingErr } = await supabase
+      .from("meetings")
+      .insert({
+        owner_id: user.id,
+        title: title.trim(),
+        description: description.trim() || null,
+        meeting_date: new Date(meetingDate).toISOString(),
+        source_type: sourceType,
+        recording_consent_confirmed_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+    if (meetingErr) throw new Error(meetingErr.message);
+    const meetingId = meeting.id as string;
+    meetingIdRef.current = meetingId;
+
+    const names = participantNames
+      .split(",")
+      .map((n) => n.trim())
+      .filter(Boolean);
+    if (names.length > 0) {
+      const { error: pErr } = await supabase.from("participants").insert(
+        names.map((n) => ({
+          meeting_id: meetingId,
+          owner_id: user.id,
+          display_name: n,
+        })),
+      );
+      if (pErr) throw new Error(pErr.message);
+    }
+
+    return { supabase, meetingId, ownerId: user.id };
+  }
+
+  /**
+   * Called by the recorder when the user presses Start. Creates the meeting
+   * (source_type 'browser') plus a capture_sessions row, then hands ids back
+   * so the recorder can drive the session lifecycle.
+   */
+  async function prepareCapture(): Promise<PreparedMeeting> {
+    if (!consent) {
+      throw new Error("Confirm recording consent before starting.");
+    }
+    if (!title.trim()) {
+      throw new Error("Enter a title before recording.");
+    }
+    const { supabase, meetingId, ownerId } = await createMeeting("browser");
+    const { data: session, error: sErr } = await supabase
+      .from("capture_sessions")
+      .insert({
+        meeting_id: meetingId,
+        owner_id: ownerId,
+        source_type: "browser",
+        status: "created",
+      })
+      .select("id")
+      .single();
+    if (sErr) throw new Error(sErr.message);
+    return { meetingId, sessionId: session.id as string, ownerId };
+  }
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (mode !== "upload") return; // record mode drives itself
     if (!file || fileError || !consent) return;
 
     setError(null);
     setPhase({ name: "creating" });
-    const supabase = createClient();
 
     try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) throw new Error("You must be signed in.");
-
-      // 1. Create the meeting record.
-      const { data: meeting, error: meetingErr } = await supabase
-        .from("meetings")
-        .insert({
-          owner_id: user.id,
-          title: title.trim(),
-          description: description.trim() || null,
-          meeting_date: new Date(meetingDate).toISOString(),
-          recording_consent_confirmed_at: new Date().toISOString(),
-        })
-        .select("id")
-        .single();
-      if (meetingErr) throw new Error(meetingErr.message);
-      const meetingId = meeting.id as string;
-      meetingIdRef.current = meetingId;
-
-      // 2. Record named participants (optional).
-      const names = participantNames
-        .split(",")
-        .map((n) => n.trim())
-        .filter(Boolean);
-      if (names.length > 0) {
-        const { error: pErr } = await supabase.from("participants").insert(
-          names.map((n) => ({
-            meeting_id: meetingId,
-            owner_id: user.id,
-            display_name: n,
-          })),
-        );
-        if (pErr) throw new Error(pErr.message);
-      }
+      const { supabase, meetingId, ownerId } = await createMeeting("upload");
 
       // 3. Begin upload (draft -> uploading).
       const { error: beginErr } = await supabase.rpc("begin_meeting_upload", {
@@ -146,7 +186,7 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
 
       // 4. Signed upload directly to private storage.
       const safeName = file.name.replace(/[^\w.\-]+/g, "_");
-      const path = `${user.id}/${meetingId}/${crypto.randomUUID()}-${safeName}`;
+      const path = `${ownerId}/${meetingId}/${crypto.randomUUID()}-${safeName}`;
       const { data: signed, error: signErr } = await supabase.storage
         .from(STORAGE_BUCKET)
         .createSignedUploadUrl(path);
@@ -181,7 +221,7 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
     }
   }
 
-  const busy = phase.name !== "form";
+  const busy = phase.name !== "form" || captureBusy;
 
   return (
     <form
@@ -244,14 +284,66 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
         </label>
 
         <div>
-          <span className="mb-1 block text-sm font-medium">Recording</span>
-          <label
-            className={`flex cursor-pointer flex-col items-center justify-center rounded-md border-2 border-dashed px-4 py-8 text-center text-sm ${
-              busy
-                ? "cursor-not-allowed opacity-60"
-                : "border-border hover:border-accent"
-            }`}
+          <span className="mb-1 block text-sm font-medium">Audio source</span>
+          <div
+            role="tablist"
+            aria-label="Audio source"
+            className="grid grid-cols-2 gap-2"
           >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "upload"}
+              onClick={() => setMode("upload")}
+              disabled={busy}
+              className={`rounded-md border px-3 py-2 text-sm font-medium ${
+                mode === "upload"
+                  ? "border-accent bg-accent/10 text-accent-strong"
+                  : "border-border text-muted hover:border-accent"
+              }`}
+            >
+              Upload a file
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "record"}
+              onClick={() => setMode("record")}
+              disabled={busy}
+              className={`rounded-md border px-3 py-2 text-sm font-medium ${
+                mode === "record"
+                  ? "border-accent bg-accent/10 text-accent-strong"
+                  : "border-border text-muted hover:border-accent"
+              }`}
+            >
+              Record in browser
+            </button>
+          </div>
+        </div>
+
+        {mode === "record" && (
+          <CaptureRecorder
+            maxUploadBytes={maxUploadBytes}
+            onPrepare={prepareCapture}
+            onComplete={(meetingId) => {
+              router.push(`/meetings/${meetingId}`);
+              router.refresh();
+            }}
+            onError={(message) => setError(message || null)}
+            onBusyChange={setCaptureBusy}
+          />
+        )}
+
+        {mode === "upload" && (
+          <div>
+            <span className="mb-1 block text-sm font-medium">Recording</span>
+            <label
+              className={`flex cursor-pointer flex-col items-center justify-center rounded-md border-2 border-dashed px-4 py-8 text-center text-sm ${
+                busy
+                  ? "cursor-not-allowed opacity-60"
+                  : "border-border hover:border-accent"
+              }`}
+            >
             <input
               type="file"
               accept={[
@@ -275,12 +367,13 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
               </span>
             )}
           </label>
-          {fileError && (
-            <p role="alert" className="mt-1 text-sm text-danger">
-              {fileError}
-            </p>
-          )}
-        </div>
+            {fileError && (
+              <p role="alert" className="mt-1 text-sm text-danger">
+                {fileError}
+              </p>
+            )}
+          </div>
+        )}
 
         <label className="flex items-start gap-2 text-sm">
           <input
@@ -329,6 +422,7 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
         )}
 
         <div className="flex items-center gap-3">
+          {mode === "upload" && (
           <button
             type="submit"
             disabled={busy || !file || !!fileError || !consent}
@@ -342,6 +436,7 @@ export function NewMeetingForm({ maxUploadBytes }: { maxUploadBytes: number }) {
                   ? "Starting processing…"
                   : "Upload and process"}
           </button>
+          )}
           {phase.name === "uploading" && (
             <button
               type="button"

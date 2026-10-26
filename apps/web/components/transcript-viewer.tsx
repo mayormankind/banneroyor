@@ -6,21 +6,28 @@ import {
   assignSpeaker,
   updateSegmentText,
 } from "@/app/(app)/meetings/[id]/actions";
-import type { Participant, TranscriptSegment } from "@/lib/types";
+import type { Participant, SpeakerProfile, TranscriptSegment } from "@/lib/types";
 
 interface Props {
   meetingId: string;
   segments: TranscriptSegment[];
   participants: Participant[];
+  speakerProfiles?: Pick<SpeakerProfile, "id" | "display_name">[];
 }
 
-export function TranscriptViewer({ meetingId, segments, participants }: Props) {
+export function TranscriptViewer({
+  meetingId,
+  segments,
+  participants,
+  speakerProfiles = [],
+}: Props) {
   const [filter, setFilter] = useState("");
   const [speakerFilter, setSpeakerFilter] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
   const [assigningLabel, setAssigningLabel] = useState<string | null>(null);
   const [assignName, setAssignName] = useState("");
+  const [assignRemember, setAssignRemember] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
@@ -234,12 +241,18 @@ export function TranscriptViewer({ meetingId, segments, participants }: Props) {
 
                   {assigningLabel === label && label && (
                     <form
-                      className="ml-14 mt-2 flex items-center gap-2 rounded-md bg-stone-50 p-2"
+                      className="ml-14 mt-2 flex flex-wrap items-center gap-2 rounded-md bg-stone-50 p-2"
                       onSubmit={(e) => {
                         e.preventDefault();
                         run(async () => {
-                          await assignSpeaker(meetingId, label, assignName);
+                          await assignSpeaker(
+                            meetingId,
+                            label,
+                            assignName,
+                            assignRemember,
+                          );
                           setAssigningLabel(null);
+                          setAssignRemember(false);
                         });
                       }}
                     >
@@ -249,8 +262,22 @@ export function TranscriptViewer({ meetingId, segments, participants }: Props) {
                         onChange={(e) => setAssignName(e.target.value)}
                         placeholder="Who is this speaker?"
                         aria-label="Speaker name"
+                        list="known-speakers"
                         className="rounded-md border border-border bg-background px-2 py-1 text-sm"
                       />
+                      <datalist id="known-speakers">
+                        {speakerProfiles.map((p) => (
+                          <option key={p.id} value={p.display_name} />
+                        ))}
+                      </datalist>
+                      <label className="flex items-center gap-1 text-xs text-muted">
+                        <input
+                          type="checkbox"
+                          checked={assignRemember}
+                          onChange={(e) => setAssignRemember(e.target.checked)}
+                        />
+                        Remember speaker
+                      </label>
                       <button
                         type="submit"
                         disabled={pending}

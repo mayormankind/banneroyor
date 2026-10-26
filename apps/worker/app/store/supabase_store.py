@@ -98,13 +98,94 @@ class SupabaseStore:
     def download_source(self, path: str) -> bytes:
         return self.client.storage.from_(self.bucket).download(path)
 
-    def speaker_reference_clips(self, owner_id: str) -> list[dict]:
+    # --- capture / live sync -------------------------------------------------
+
+    def get_capture_session(self, session_id: str) -> dict | None:
+        res = (
+            self.client.table("capture_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
+    def list_capture_parts(self, session_id: str) -> list[dict]:
+        res = (
+            self.client.table("capture_parts")
+            .select("*")
+            .eq("session_id", session_id)
+            .order("part_index")
+            .execute()
+        )
+        return res.data or []
+
+    def commit_capture_sync(
+        self,
+        *,
+        session_id: str,
+        expected_cursor: int,
+        new_cursor: int,
+        new_ms_end: int,
+        segments: list[dict],
+    ) -> bool:
+        """Atomically commit a sync run. False means a concurrent sync won."""
+        res = self.client.rpc(
+            "commit_capture_sync",
+            {
+                "p_session_id": session_id,
+                "p_expected_cursor": expected_cursor,
+                "p_new_cursor": new_cursor,
+                "p_new_ms_end": new_ms_end,
+                "p_segments": segments,
+            },
+        ).execute()
+        return bool(res.data)
+
+    def list_live_segments(self, session_id: str) -> list[dict]:
+        """Provisional transcript for a capture session, in timeline order."""
+        res = (
+            self.client.table("live_transcript_segments")
+            .select("run_part_index, segment_index, speaker_label, start_ms, end_ms, text")
+            .eq("session_id", session_id)
+            .order("start_ms")
+            .execute()
+        )
+        return res.data or []
+
+    def commit_capture_intel(
+        self,
+        *,
+        session_id: str,
+        expected_cursor: int,
+        new_cursor: int,
+        items: list[dict],
+    ) -> bool:
+        """Atomically replace a session's live-intelligence candidate set."""
+        res = self.client.rpc(
+            "commit_capture_intel",
+            {
+                "p_session_id": session_id,
+                "p_expected_cursor": expected_cursor,
+                "p_new_cursor": new_cursor,
+                "p_items": items,
+            },
+        ).execute()
+        return bool(res.data)
+
+    def complete_capture_sessions(self, meeting_id: str) -> None:
+        """Mark uploaded capture sessions completed once the meeting's final
+        report is persisted (the batch pass is authoritative)."""
+        self.client.table("capture_sessions").update(
+            {"status": "completed", "ended_at": _utcnow()}
+        ).eq("meeting_id", meeting_id).eq("status", "uploaded").execute()
+
+    def speaker_profiles_for_owner(self, owner_id: str) -> list[dict]:
         res = (
             self.client.table("speaker_profiles")
-            .select("display_name, reference_storage_path")
+            .select("id, display_name, reference_storage_path")
             .eq("owner_id", owner_id)
-            .not_.is_("reference_storage_path", "null")
-            .limit(4)
+            .order("created_at")
             .execute()
         )
         return res.data or []
@@ -176,6 +257,7 @@ class SupabaseStore:
                 "failure_reason": None,
             }
         ).eq("id", meeting_id).execute()
+        self.complete_capture_sessions(meeting_id)
 
     def fail_job(
         self,
@@ -239,12 +321,14 @@ class SupabaseStore:
         owner_id: str,
         run_id: str,
         speaker_labels: list[str],
-        known_names: set[str],
+        known_profiles: dict[str, str],
     ) -> dict[str, str]:
         """Ensure each raw speaker label has a participant row and link
-        segments. Returns speaker_label -> participant_id."""
+        segments. known_profiles maps provider-verified speaker names to
+        speaker_profiles ids. Returns speaker_label -> participant_id."""
         mapping: dict[str, str] = {}
         for label in speaker_labels:
+            profile_id = known_profiles.get(label)
             res = (
                 self.client.table("participants")
                 .select("id")
@@ -255,10 +339,14 @@ class SupabaseStore:
             )
             if res.data:
                 pid = res.data[0]["id"]
+                if profile_id:
+                    self.client.table("participants").update(
+                        {"speaker_profile_id": profile_id}
+                    ).eq("id", pid).execute()
             else:
                 # If the label is a verified known-speaker name, keep it;
                 # otherwise use a neutral display name.
-                display = label if label in known_names else friendly_speaker_name(label)
+                display = label if profile_id else friendly_speaker_name(label)
                 ins = (
                     self.client.table("participants")
                     .insert(
@@ -267,6 +355,7 @@ class SupabaseStore:
                             "owner_id": owner_id,
                             "display_name": display,
                             "speaker_label": label,
+                            "speaker_profile_id": profile_id,
                         }
                     )
                     .execute()
@@ -275,7 +364,7 @@ class SupabaseStore:
             mapping[label] = pid
 
             self.client.table("transcript_segments").update(
-                {"participant_id": pid}
+                {"participant_id": pid, "speaker_profile_id": profile_id}
             ).eq("meeting_id", meeting_id).eq("run_id", run_id).eq(
                 "speaker_label", label
             ).execute()

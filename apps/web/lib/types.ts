@@ -52,6 +52,7 @@ export interface Participant {
   display_name: string;
   email: string | null;
   speaker_label: string | null;
+  speaker_profile_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -147,6 +148,20 @@ export interface Question {
   timestamp_ms: number | null;
   generation_version: string;
   is_edited: boolean;
+}
+
+export interface LiveIntelligenceItem {
+  id: string;
+  session_id: string;
+  meeting_id: string;
+  run_part_index: number;
+  item_index: number;
+  kind: "key_point" | "decision" | "action_item" | "question";
+  content: string;
+  speaker_label: string | null;
+  timestamp_ms: number | null;
+  evidence_segment_indices: number[];
+  created_at: string;
 }
 
 export interface ProcessingJob {

@@ -88,8 +88,10 @@ def probe(path: str) -> MediaInfo:
         )
     try:
         duration = float(meta["format"]["duration"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise MediaValidationError(detail="missing duration in ffprobe output") from exc
+    except (KeyError, TypeError, ValueError):
+        # Streaming containers (e.g. MediaRecorder WebM) never carry a
+        # duration field — measure by decoding instead.
+        duration = _decoded_duration(path)
     if duration <= 0:
         raise MediaValidationError(detail="non-positive media duration")
     return MediaInfo(
@@ -98,6 +100,27 @@ def probe(path: str) -> MediaInfo:
         has_video=has_video,
         format_name=str(meta.get("format", {}).get("format_name", "")),
     )
+
+
+def _decoded_duration(path: str) -> float:
+    """Measure media duration by decoding to null and reading the final
+    timestamp. Slower than metadata but works for duration-less containers
+    (streaming WebM from MediaRecorder)."""
+    res = _run(
+        [
+            FFMPEG, "-hide_banner", "-nostats",
+            "-i", path,
+            "-vn", "-f", "null", "-",
+        ],
+        TRANSCODE_TIMEOUT,
+    )
+    times = re.findall(r"time=(\d+):(\d+):([\d.]+)", res.stderr)
+    if not times:
+        raise MediaValidationError(
+            detail="could not measure media duration by decoding"
+        )
+    h, m, s = times[-1]
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 
 def normalize_audio(src: str, dst_dir: str) -> str:
@@ -122,6 +145,29 @@ def normalize_audio(src: str, dst_dir: str) -> str:
             "Audio extraction failed.", detail=res.stderr[-500:]
         )
     return out
+
+
+def extract_audio_slice(
+    src: str, start_seconds: float, end_seconds: float | None, dst: str
+) -> str:
+    """Extract audio [start_seconds, end_seconds) as 16 kHz mono MP3; a None
+    end slices to EOF. Used by the near-live sync path to transcribe only the
+    newest part of a capture — end=None matters because the live concat is a
+    streaming WebM with no duration metadata."""
+    res = _run(
+        [
+            FFMPEG, "-y", "-v", "error",
+            "-ss", f"{start_seconds:.3f}",
+            *(["-to", f"{end_seconds:.3f}"] if end_seconds is not None else []),
+            "-i", src,
+            "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
+            "-f", "mp3", dst,
+        ],
+        TRANSCODE_TIMEOUT,
+    )
+    if res.returncode != 0:
+        raise RetryableError("Live audio slicing failed.", detail=res.stderr[-500:])
+    return dst
 
 
 def detect_silences(

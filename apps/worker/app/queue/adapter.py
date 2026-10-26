@@ -4,14 +4,21 @@ PGMQ implementation can be swapped without touching pipeline code."""
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+JOB_TYPE_PROCESS_MEETING = "process_meeting"
+JOB_TYPE_CAPTURE_SYNC = "capture_sync"
+SUPPORTED_JOB_TYPES = {JOB_TYPE_PROCESS_MEETING, JOB_TYPE_CAPTURE_SYNC}
+
 
 @dataclass(frozen=True)
 class QueueMessage:
     msg_id: int
     read_ct: int
     meeting_id: str
-    job_id: str
     job_type: str
+    # process_meeting messages carry a processing_jobs row id.
+    job_id: str | None = None
+    # capture_sync messages carry the capture session to sync.
+    capture_session_id: str | None = None
 
 
 class QueueAdapter(Protocol):
@@ -26,16 +33,28 @@ def parse_message(raw: dict[str, Any], msg_id: int, read_ct: int) -> QueueMessag
     if not isinstance(raw, dict):
         raise ValueError("queue message is not an object")
     meeting_id = raw.get("meeting_id")
-    job_id = raw.get("job_id")
-    job_type = raw.get("job_type", "process_meeting")
-    if not isinstance(meeting_id, str) or not isinstance(job_id, str):
-        raise ValueError("queue message missing meeting_id/job_id")
-    if job_type != "process_meeting":
+    job_type = raw.get("job_type", JOB_TYPE_PROCESS_MEETING)
+    if not isinstance(meeting_id, str):
+        raise ValueError("queue message missing meeting_id")
+    if job_type not in SUPPORTED_JOB_TYPES:
         raise ValueError(f"unsupported job_type: {job_type}")
+
+    job_id = raw.get("job_id")
+    capture_session_id = raw.get("capture_session_id")
+    if job_type == JOB_TYPE_PROCESS_MEETING and not isinstance(job_id, str):
+        raise ValueError("process_meeting message missing job_id")
+    if job_type == JOB_TYPE_CAPTURE_SYNC and not isinstance(
+        capture_session_id, str
+    ):
+        raise ValueError("capture_sync message missing capture_session_id")
+
     return QueueMessage(
         msg_id=msg_id,
         read_ct=read_ct,
         meeting_id=meeting_id,
-        job_id=job_id,
+        job_id=job_id if isinstance(job_id, str) else None,
         job_type=job_type,
+        capture_session_id=(
+            capture_session_id if isinstance(capture_session_id, str) else None
+        ),
     )

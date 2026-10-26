@@ -35,6 +35,15 @@ export const ACCEPTED_EXTENSIONS = [
 
 export const ACTIVE_MEETING_STATUSES = ["uploading", "uploaded", "queued", "processing"];
 
+export const SOURCE_TYPE_LABEL: Record<string, string> = {
+  upload: "Uploaded file",
+  browser: "Browser recording",
+  desktop: "Desktop capture",
+  google_meet: "Google Meet",
+  zoom: "Zoom",
+  teams: "Microsoft Teams",
+};
+
 export const MEETING_STATUS_LABEL: Record<string, string> = {
   draft: "Draft",
   uploading: "Uploading",

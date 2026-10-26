@@ -59,28 +59,39 @@ def build_pipeline(settings) -> tuple[PgmqQueueAdapter, Pipeline]:
     )
 
 
+def _safe_queue_op(op, *args) -> None:
+    """Queue bookkeeping must never crash the worker — a failed ack/postpone
+    at worst delays or duplicates redelivery."""
+    try:
+        op(*args)
+    except Exception:
+        log.exception("queue operation failed")
+
+
 def _process_one(queue: PgmqQueueAdapter, pipeline: Pipeline, msg) -> None:
     try:
         action, delay = pipeline.process(msg)
     except InvalidMessageError as exc:
         log.warning("invalid queue message: %s", exc.safe_message)
-        queue.archive(msg.msg_id)
+        _safe_queue_op(queue.archive, msg.msg_id)
         return
     except Exception:  # noqa: BLE001 — last line of defense
         log.exception("unhandled worker error")
         # Bound redelivery for unhandled errors using the queue's read count.
         if msg.read_ct >= 5:
-            queue.archive(msg.msg_id)
+            _safe_queue_op(queue.archive, msg.msg_id)
         else:
-            queue.postpone(msg.msg_id, backoff_seconds(msg.read_ct))
+            _safe_queue_op(
+                queue.postpone, msg.msg_id, backoff_seconds(msg.read_ct)
+            )
         return
 
     if action == "done":
-        queue.ack(msg.msg_id)
+        _safe_queue_op(queue.ack, msg.msg_id)
     elif action == "retry":
-        queue.postpone(msg.msg_id, delay)
+        _safe_queue_op(queue.postpone, msg.msg_id, delay)
     else:  # failed — terminal, keep in archive for operators
-        queue.archive(msg.msg_id)
+        _safe_queue_op(queue.archive, msg.msg_id)
 
 
 def main() -> None:
